@@ -7,6 +7,11 @@
  *  - 候选拒绝、候选提前结束、AudioContext 恢复失败时，原主路继续输出。
  *  - 活动主路（武装后的主路、切换后的备路）一旦 ended 即进入 fault，
  *    必须重新试听主、备之后才允许再次武装。
+ *  - 可选“故障自动接管”（默认关闭，关闭时保持上述故障态行为）：武装态下
+ *    活动主路 ended 且备用监听流仍有效时，以当前代次裁决把已取得的备用
+ *    监听流转成活动输出（不再调用 getUserMedia），增益切换完成后才释放
+ *    旧主路；备用先断 / AudioContext 不可用 / 停止已开始 / 手动切换进行中
+ *    时一律不接管，按原故障清理规则释放资源。
  */
 
 export type Which = 'primary' | 'backup'
@@ -16,7 +21,7 @@ export type Phase =
   | 'idle' // 已授权，可选择设备 / 试听
   | 'audition' // 至少一路试听在线
   | 'armed' // 主路已武装为活动线路，禁止另开试听
-  | 'switching' // 80ms 交叉淡化进行中
+  | 'switching' // 80ms 交叉淡化 / 故障自动接管增益切换进行中
   | 'live' // 切换完成，备路活动输出
   | 'fault' // 活动主路结束或切换中候选夭折；需重新试听
 
@@ -53,6 +58,10 @@ export interface Snapshot {
   backup: ChannelView
   /** 当前正在输出的活动线路归属：null 表示没有活动输出。 */
   activeWhich: Which | null
+  /** 故障自动接管开关（默认关闭）。 */
+  autoTakeover: boolean
+  /** 最近一次故障 / 自动接管的来源线路；停止或重新武装后清空。 */
+  faultSource: Which | null
   /** 是否仍有任何 MediaStreamTrack 处于 live（浏览器麦克风占用指示）。 */
   micActive: boolean
   /** 武装按钮可用性：两路都试听成功且当前没有进行中的代次。 */

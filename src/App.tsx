@@ -58,6 +58,26 @@ export default function App() {
           <span className="gen" data-testid="generation">
             代次 #{s.generation}
           </span>
+          {s.faultSource && (
+            <span className="fault-source" data-testid="fault-source">
+              故障来源：{s.faultSource === 'primary' ? '主路' : '备路'}
+            </span>
+          )}
+        </div>
+
+        <div className="console-row options-row">
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={s.autoTakeover}
+              onChange={(e) => engine.setAutoTakeover(e.target.checked)}
+              data-testid="toggle-auto-takeover"
+            />
+            故障自动接管
+            <span className="hint">
+              主路断轨且备用监听在线时，已取得的备用流经 80ms 增益切换直接接管耳返（默认关闭）
+            </span>
+          </label>
         </div>
 
         <p
@@ -137,6 +157,10 @@ export default function App() {
           <li>淡化未完成时可撤销：从当前增益平滑回到主路，完成后才释放备用设备。</li>
           <li>候选拒绝 / 提前结束 / 音频上下文恢复失败：保留原主路。</li>
           <li>活动主路结束即进入故障态，须重新试听主、备后方可再次武装。</li>
+          <li>
+            故障自动接管（可选，默认关闭）：武装后主路断轨且备用监听仍在线时，备用流直接接管耳返，
+            不重新取流；备用先断 / 切换或停止进行中时不接管，按原故障规则清理。
+          </li>
           <li>停止会断开全部节点并关闭音频上下文，不残留麦克风占用。</li>
         </ul>
       </section>

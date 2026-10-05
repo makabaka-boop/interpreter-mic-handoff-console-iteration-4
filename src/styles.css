@@ -266,6 +266,36 @@ select {
   padding-top: 4px;
 }
 
+.options-row {
+  margin-bottom: 14px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.toggle input {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+
+.toggle .hint {
+  margin-left: 2px;
+}
+
+.fault-source {
+  color: var(--warn);
+  font-size: 13px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
 .rules {
   margin: 18px 0 0;
   padding-left: 20px;

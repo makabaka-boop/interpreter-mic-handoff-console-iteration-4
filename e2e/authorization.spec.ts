@@ -65,6 +65,24 @@ test('授权后可枚举设备，主备试听在线，武装并完成 80ms 切�
   await page.close()
 })
 
+test('故障自动接管开关默认关闭，切换后如实显示在页面上', async ({ context }) => {
+  const page = await context.newPage()
+  await gotoFresh(page)
+
+  const toggle = page.getByTestId('toggle-auto-takeover')
+  await expect(toggle).toBeVisible()
+  await expect(toggle).not.toBeChecked()
+  await expect(page.getByTestId('fault-source')).toHaveCount(0)
+
+  await toggle.check()
+  await expect(toggle).toBeChecked()
+  await expect(page.getByTestId('message')).toContainText('已开启故障自动接管')
+
+  await toggle.uncheck()
+  await expect(page.getByTestId('message')).toContainText('已关闭故障自动接管')
+  await page.close()
+})
+
 test('拒绝麦克风权限时显示拒绝原因，且不进入可武装状态', async ({ browser }) => {
   const context = await browser.newContext()
   // Chromium 假 UI 会自动接受，无法模拟用户点“阻止”。

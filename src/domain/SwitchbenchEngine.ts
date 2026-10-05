@@ -61,7 +61,7 @@ const emptyChannel = (): ChannelRuntime => ({
   level: 0,
 })
 
-type FadeKind = 'switch' | 'revert' | 'recover'
+type FadeKind = 'switch' | 'revert' | 'recover' | 'takeover'
 
 interface GainRamp {
   from: number
@@ -104,6 +104,10 @@ export class SwitchbenchEngine {
 
   /** 当前活动（正在对外输出）的线路归属。 */
   private activeWhich: Which | null = null
+  /** 故障自动接管开关（默认关闭，关闭时保持原故障态行为）。 */
+  private autoTakeoverEnabled = false
+  /** 最近一次故障 / 自动接管的来源线路；停止或重新武装后清空。 */
+  private faultSource: Which | null = null
   /** 切换过程中的备用候选；就绪、淡化、提升都围绕它。 */
   private candidate: { line: InternalLine } | null = null
   private fade: FadeSession | null = null
@@ -360,10 +364,28 @@ export class SwitchbenchEngine {
     this.generation++
     this.phase = 'armed'
     this.activeWhich = 'primary'
+    this.faultSource = null
     // 主路成为耳返输出，备路监听静音待机（切换失败时恢复）。
     const backupMon = this.channels.backup.line
     if (backupMon) this.setMuted(backupMon, true)
     this.message = '主路已武装并持续输出；备用静默待机。武装期间不能再开试听。'
+    this.publish()
+  }
+
+  // ------------------------------------------------------------- 设置
+
+  /**
+   * 故障自动接管开关（默认关闭）。开启后，武装态下活动主路断轨且备用监听
+   * 仍在线时，已取得的备用流直接接管耳返，不再等待重新授权 / 重新取流。
+   * 开关本身只是偏好，不打断任何进行中的代次。
+   */
+  setAutoTakeover(enabled: boolean): void {
+    if (!this.supported) return
+    if (this.autoTakeoverEnabled === enabled) return
+    this.autoTakeoverEnabled = enabled
+    this.message = enabled
+      ? '已开启故障自动接管：武装后主路断轨且备用监听在线时，备用流将直接接管耳返。'
+      : '已关闭故障自动接管：活动主路断轨将按原规则进入故障态。'
     this.publish()
   }
 
@@ -557,6 +579,26 @@ export class SwitchbenchEngine {
   private completeFade(fade: FadeSession, gen: number): void {
     if (this.fade !== fade || gen !== this.generation) return
 
+    if (fade.kind === 'takeover') {
+      const promoted = fade.candidate
+      if (!promoted) return
+      // 增益切换至此完成：备用监听已被提升为活动输出，此刻才释放旧主路。
+      promoted.muted = false
+      promoted.gain.gain.value = 1
+      this.activeWhich = 'backup'
+      this.fade = null
+      this.releaseLine(fade.primary)
+      const primary = this.channels.primary
+      if (primary.line === fade.primary) {
+        primary.line = null
+        primary.auditioned = false
+      }
+      this.phase = 'live'
+      this.message = `主路故障，已自动接管：备用线路（${this.channels.backup.deviceLabel}）经 80ms 增益切换接管耳返输出，旧主路已释放。`
+      this.publish()
+      return
+    }
+
     if (fade.kind === 'switch') {
       const candidate = fade.candidate
       if (!candidate) return
@@ -669,6 +711,7 @@ export class SwitchbenchEngine {
     this.channels.backup.deviceLabel = this.lastBackupLabel
     this.activeWhich = null
     this.candidate = null
+    this.faultSource = null
     this.phase = 'idle'
     this.message = '已停止：全部轨道已停止、节点已断开、音频上下文已关闭。'
     this.publish()
@@ -676,15 +719,93 @@ export class SwitchbenchEngine {
 
   // ------------------------------------------------------------- 轨道事件
 
+  /**
+   * 活动主路 ended 时尝试故障自动接管。全部前置条件满足才接管，任一不满足
+   * 即回退到原故障清理规则：
+   *  - 开关已启用（默认关闭）；
+   *  - 处于武装态且无淡化 / 候选（手动切换、撤销、停止进行中一律不接管）；
+   *  - AudioContext 可用；
+   *  - 备用监听线路仍有效（已建立、未释放、仍有 live 轨道）。
+   * 接管全程不再调用 getUserMedia：直接提升已取得的备用监听流。
+   */
+  private tryAutoTakeover(primaryLine: InternalLine): boolean {
+    if (!this.autoTakeoverEnabled) return false
+    if (this.phase !== 'armed' || this.fade || this.candidate) return false
+    const ctx = this.ctx
+    if (!ctx || ctx.state === 'closed') return false
+    const backupLine = this.channels.backup.line
+    if (!backupLine || backupLine.released) return false
+    if (!backupLine.tracks.some((t) => t.readyState === 'live')) return false
+    this.beginAutoTakeover(primaryLine, backupLine, ctx)
+    return true
+  }
+
+  /**
+   * 以当前代次裁决开启接管淡化：排定备用监听 0→1、旧主路 1→0 的增益切换，
+   * 待 completeFade 确认完成后才释放旧主路节点与轨道。
+   * 旧主路的结束侦听与电平表立即摘除：其迟到 / 重复 ended 不得再次进入，
+   * 更不得清掉正在接管的新线路。
+   */
+  private beginAutoTakeover(
+    primaryLine: InternalLine,
+    backupLine: InternalLine,
+    ctx: AudioContextLike,
+  ): void {
+    this.generation++
+    const gen = this.generation
+    this.faultSource = 'primary'
+
+    this.stopMeter(primaryLine)
+    for (const [track, fn] of primaryLine.endFns) {
+      track.removeEventListener('ended', fn)
+    }
+    primaryLine.endFns = []
+
+    const now = ctx.currentTime
+    const end = now + CROSSFADE_MS / 1000
+    const fade: FadeSession = {
+      gen,
+      kind: 'takeover',
+      timer: 0,
+      primary: primaryLine,
+      candidate: backupLine,
+      oldMonitor: null,
+      primaryRamp: { from: 1, to: 0, start: now, end },
+      backupRamp: { from: 0, to: 1, start: now, end },
+    }
+    this.scheduleRamp(primaryLine, fade.primaryRamp)
+    this.scheduleRamp(backupLine, fade.backupRamp)
+    fade.timer = this.scheduleFadeEnd(fade, end)
+    this.fade = fade
+    this.phase = 'switching'
+    this.message = '主路轨道已结束，故障自动接管进行中：备用监听经 80ms 增益切换接管耳返…'
+    this.publish()
+  }
+
   private handleTrackEnded(line: InternalLine): void {
     if (line.released) return
 
+    // 自动接管淡化已持有旧主路：其迟到 / 重复 ended 不得再次进入。
+    if (this.fade?.kind === 'takeover' && this.fade.primary === line) return
+
     // 活动主路（武装后的主路 / 交叉中仍在输出的主路 / 已提升的备路）结束 → 故障。
     if (this.activeLine() === line) {
+      if (line.which === 'primary' && this.tryAutoTakeover(line)) return
       this.enterFault(
         line.which === 'primary'
           ? '活动主路轨道已结束，进入故障态。请重新试听主、备线路后再武装。'
           : '活动备用线路轨道已结束，进入故障态。请重新试听主、备线路后再武装。',
+        line.which,
+      )
+      return
+    }
+
+    // 自动接管淡化中被提升的备路夭折：接管失败，按原故障规则清理全部资源。
+    if (this.fade?.kind === 'takeover' && this.fade.candidate === line) {
+      this.releaseLine(line)
+      this.enterFault(
+        '备用线路在故障自动接管中结束，接管失败，进入故障态。请重新试听主、备线路后再武装。',
+        'backup',
       )
       return
     }
@@ -719,12 +840,13 @@ export class SwitchbenchEngine {
     this.publish()
   }
 
-  private enterFault(reason: string): void {
+  private enterFault(reason: string, source: Which): void {
     // 故障递增代次：所有在途试听 / 候选 / 淡化回调即刻失效并释放。
     this.generation++
     this.releaseAll()
     this.candidate = null
     this.activeWhich = null
+    this.faultSource = source
     this.channels.primary.auditioned = false
     this.channels.backup.auditioned = false
     this.channels.primary.requesting = false
@@ -1069,6 +1191,8 @@ export class SwitchbenchEngine {
       primary: this.viewOf('primary'),
       backup: this.viewOf('backup'),
       activeWhich: this.activeWhich,
+      autoTakeover: this.autoTakeoverEnabled,
+      faultSource: this.faultSource,
       micActive: this.micActive(),
       canArm,
       auditionLocked:

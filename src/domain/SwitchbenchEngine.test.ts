@@ -1106,3 +1106,298 @@ describe('SwitchbenchEngine — 授权/清单/改选与界面状态一致', () =
     expect((candidate.tracks[0] as FakeTrack).deviceId).toBe('dev-a')
   })
 })
+
+/**
+ * 确定性验收：故障自动接管（可选，默认关闭）。
+ * 用假轨道制造主路断轨 / 备用先断 / 重复与迟到 ended，用可控音频时钟与
+ * 手动定时器核对增益切换顺序、代次裁决、停止 / 撤销 / 手动切换交错下的
+ * 唯一资源所有者，以及全程零重复取流。
+ */
+describe('SwitchbenchEngine — 故障自动接管', () => {
+  async function armedHarness(takeover: boolean) {
+    const h = harness()
+    await authorizeOk(h)
+    const primary = await auditionOk(h, 'primary', 'dev-primary')
+    const backupMon = await auditionOk(h, 'backup', 'dev-backup')
+    h.engine.arm()
+    if (takeover) h.engine.setAutoTakeover(true)
+    return { h, primary, backupMon }
+  }
+
+  it('开关默认关闭，可往返切换并如实写入快照与提示', async () => {
+    const h = harness()
+    await authorizeOk(h)
+    expect(h.snap().autoTakeover).toBe(false)
+
+    h.engine.setAutoTakeover(true)
+    expect(h.snap().autoTakeover).toBe(true)
+    expect(h.snap().message).toContain('已开启故障自动接管')
+
+    h.engine.setAutoTakeover(false)
+    expect(h.snap().autoTakeover).toBe(false)
+    expect(h.snap().message).toContain('已关闭故障自动接管')
+  })
+
+  it('默认关闭：主路断轨保持原故障态行为，不触碰备用取流', async () => {
+    const { h, primary, backupMon } = await armedHarness(false)
+    expect(h.snap().autoTakeover).toBe(false)
+    const requestsBefore = h.media.requests.length
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.faultSource).toBe('primary')
+    expect(s.message).toContain('故障态')
+    expect(s.message).not.toContain('已自动接管')
+    expect(s.micActive).toBe(false)
+    expect(backupMon.tracks[0].stopCount).toBe(1) // 故障清理释放备用监听
+    expect(h.media.requests.length).toBe(requestsBefore)
+  })
+
+  it('启用后：备用监听直接接管，零重复取流，增益切换完成后才释放旧主路', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+    const primLine = h.lineOf('primary')
+    const backupLine = h.lineOf('backup')
+    const primGain = h.gainOf(primLine).gain
+    const backupGain = h.gainOf(backupLine).gain
+    expect(backupGain.value).toBe(0) // 武装后备用监听静音待机
+    const requestsBefore = h.media.requests.length
+    const genBefore = h.engine.getGeneration()
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+
+    // 以当前代次裁决：代次 +1，进入接管淡化（复用 switching 阶段）。
+    expect(h.engine.getGeneration()).toBe(genBefore + 1)
+    expect(h.snap().phase).toBe('switching')
+    expect(h.snap().busy).toBe(true)
+    // 零重复取流：没有新增 getUserMedia 调用。
+    expect(h.media.requests.length).toBe(requestsBefore)
+    // 可验证的增益切换已排定：备用监听 0→1，旧主路 1→0，80ms 完成回调在案。
+    expect(
+      backupGain.events.some((e) => e.method === 'setValueAtTime' && e.value === 0),
+    ).toBe(true)
+    expect(
+      backupGain.events.some(
+        (e) => e.method === 'linearRampToValueAtTime' && e.value === 1,
+      ),
+    ).toBe(true)
+    expect(
+      primGain.events.some((e) => e.method === 'linearRampToValueAtTime' && e.value === 0),
+    ).toBe(true)
+    expect(h.clock.delayCalls.some((d) => d.ms === 80)).toBe(true)
+    // 增益切换完成前旧主路尚未释放，备用轨道未被停止。
+    expect((primLine.source as FakeAudioNode).disconnectCount).toBe(0)
+    expect(primary.tracks[0].stopCount).toBe(0)
+    expect(backupMon.tracks[0].stopCount).toBe(0)
+    expect(h.snap().micActive).toBe(true)
+
+    h.clock.runFades()
+
+    const s = h.snap()
+    expect(s.phase).toBe('live')
+    expect(s.activeWhich).toBe('backup')
+    // 页面准确显示：活动设备、代次、故障来源。
+    expect(s.backup.deviceId).toBe('dev-backup')
+    expect(s.backup.status).toBe('live')
+    expect(h.lineDeviceOf('backup')).toBe('dev-backup')
+    expect(s.generation).toBe(h.engine.getGeneration())
+    expect(s.faultSource).toBe('primary')
+    expect(s.message).toContain('已自动接管')
+    // 增益切换完成后旧主路才释放；备用轨道从未停止，增益钉在 1。
+    expect((primLine.source as FakeAudioNode).disconnectCount).toBe(1)
+    expect(primary.tracks[0].stopCount).toBe(1)
+    expect(backupMon.tracks[0].stopCount).toBe(0)
+    expect(backupGain.value).toBe(1)
+    expect(s.micActive).toBe(true)
+    // 全程零重复取流。
+    expect(h.media.requests.length).toBe(requestsBefore)
+  })
+
+  it('备用轨道先断：不得展示成功接管，按原故障规则清理', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+
+    ;(backupMon.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('armed') // 主路仍输出
+    expect(h.snap().message).toContain('备用监听已结束')
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.message).toContain('故障态')
+    expect(s.message).not.toContain('已自动接管')
+    expect(s.activeWhich).toBeNull()
+    expect(s.micActive).toBe(false)
+  })
+
+  it('AudioContext 不可用：不得接管，进入故障态', async () => {
+    const { h, primary } = await armedHarness(true)
+    await h.host.ctx!.close() // 音频上下文被外部关闭
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.message).toContain('故障态')
+    expect(s.message).not.toContain('已自动接管')
+    expect(s.micActive).toBe(false)
+  })
+
+  it('手动切换进行中主路断轨：故障而非接管', async () => {
+    const { h, primary } = await armedHarness(true)
+    const p = h.engine.switchToBackup()
+    await flush()
+    const candidate = h.media.grantNext('candidate') as FakeStream
+    await flush()
+    await flush()
+    await p
+    expect(h.snap().phase).toBe('switching')
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.message).not.toContain('已自动接管')
+    expect(candidate.tracks[0].stopCount).toBe(1)
+    expect(s.micActive).toBe(false)
+  })
+
+  it('撤销切换进行中主路断轨：同样故障而非接管（撤销竞争）', async () => {
+    const { h, primary } = await armedHarness(true)
+    const p = h.engine.switchToBackup()
+    await flush()
+    const candidate = h.media.grantNext('candidate') as FakeStream
+    await flush()
+    await flush()
+    await p
+    h.host.ctx!.advance(0.04)
+    h.engine.keepPrimary()
+    expect(h.snap().phase).toBe('switching')
+
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('fault')
+    expect(candidate.tracks[0].stopCount).toBe(1)
+
+    h.host.ctx!.advance(0.04)
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('fault')
+  })
+
+  it('停止已开始时主路断轨事件不产生接管', async () => {
+    const { h, primary } = await armedHarness(true)
+    h.engine.stop()
+    // 停止已释放全部线路并摘除侦听；迟到的 ended 不得再触发任何接管。
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().message).toContain('已停止')
+    expect(h.snap().micActive).toBe(false)
+  })
+
+  it('重复与迟到 ended：旧主路第二轨事件不干扰接管，完成后旧主路事件不得清掉新线路', async () => {
+    const h = harness()
+    await authorizeOk(h)
+    // 主路试听流挂两条音频轨：第二轨的迟到 ended 模拟重复事件。
+    h.engine.selectDevice('primary', 'dev-primary')
+    const aud = h.engine.audition('primary')
+    await flush()
+    const t1 = new FakeTrack('主路轨1', 'dev-primary')
+    const t2 = new FakeTrack('主路轨2', 'dev-primary')
+    h.media.resolveWith(h.media.peekPending()[0], new FakeStream([t1, t2]))
+    await aud
+    const backupMon = await auditionOk(h, 'backup', 'dev-backup')
+    h.engine.arm()
+    h.engine.setAutoTakeover(true)
+
+    t1.endNaturally()
+    expect(h.snap().phase).toBe('switching')
+    const genAfterTakeover = h.engine.getGeneration()
+    const timersAfterTakeover = h.clock.pendingTimerCount()
+
+    // 第二轨迟到 ended：不得再次裁决、不得清理正在接管的新线路。
+    t2.endNaturally()
+    expect(h.engine.getGeneration()).toBe(genAfterTakeover)
+    expect(h.clock.pendingTimerCount()).toBe(timersAfterTakeover)
+    expect(h.snap().phase).toBe('switching')
+    expect(backupMon.tracks[0].stopCount).toBe(0)
+
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+    expect(t1.stopCount).toBe(1)
+    expect(t2.stopCount).toBe(1)
+
+    // 接管完成后旧主路已释放：任何迟到回调都不得清掉新线路。
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+    expect(backupMon.tracks[0].readyState).toBe('live')
+    expect(h.lineDeviceOf('backup')).toBe('dev-backup')
+  })
+
+  it('接管淡化进行中撤销手动切换无效：接管仍完成（撤销竞争）', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('switching')
+    expect(h.snap().canKeepPrimary).toBe(false)
+    const gen = h.engine.getGeneration()
+
+    h.engine.keepPrimary() // 接管淡化不可撤销：主路已断，无资源可回退
+    expect(h.engine.getGeneration()).toBe(gen)
+    expect(h.clock.pendingTimerCount()).toBe(1)
+
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+    expect(backupMon.tracks[0].stopCount).toBe(0)
+  })
+
+  it('接管淡化进行中停止：唯一资源所有者，迟到回调不复活线路', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('switching')
+
+    h.engine.stop()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().micActive).toBe(false)
+    expect(h.snap().activeWhich).toBeNull()
+    expect(h.snap().faultSource).toBeNull()
+    expect(primary.tracks[0].stopCount).toBe(1)
+    expect(backupMon.tracks[0].stopCount).toBe(1)
+
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().message).toContain('已停止')
+  })
+
+  it('接管淡化中备用轨道也断：接管失败，按原故障规则释放全部', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('switching')
+
+    ;(backupMon.tracks[0] as FakeTrack).endNaturally()
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.message).toContain('接管失败')
+    expect(s.message).not.toContain('已自动接管')
+    expect(s.faultSource).toBe('backup')
+    expect(s.activeWhich).toBeNull()
+    expect(s.micActive).toBe(false)
+
+    // 迟到淡化回调不得复活任何线路。
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('fault')
+  })
+
+  it('接管成功后新活动线路再断：进入故障态且来源为备路', async () => {
+    const { h, primary, backupMon } = await armedHarness(true)
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+
+    ;(backupMon.tracks[0] as FakeTrack).endNaturally()
+    const s = h.snap()
+    expect(s.phase).toBe('fault')
+    expect(s.faultSource).toBe('backup')
+    expect(s.micActive).toBe(false)
+  })
+})
